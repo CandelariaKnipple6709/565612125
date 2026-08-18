@@ -29,11 +29,17 @@ final class TabManager: ObservableObject {
     private var tabObservers: [UUID: AnyCancellable] = [:]
 
     init() {
-        ContentBlockerManager.shared.compileIfNeeded { [weak self] in
-            // Re-apply privacy scripts once the blocklists are ready in
-            // case a tab already loaded before compilation finished.
-            self?.reapplyPrivacyToAllTabs()
-        }
+        // Deliberately not reloading any tabs once this finishes. Doing
+        // so used to force-reload every open tab the instant the ad/
+        // tracker blocklists finished compiling — including whatever the
+        // user was actively doing right then (e.g. a streaming site
+        // mid-way through requesting camera permission), which silently
+        // blanked the page and restarted the camswap signaling connection
+        // from scratch. Content rule lists only need to be attached
+        // before a page's OWN load starts to matter, so it's enough that
+        // they're ready in ContentBlockerManager for the next real
+        // navigation/reload to pick up — no callback needed here at all.
+        ContentBlockerManager.shared.compileIfNeeded {}
         newTab(activate: true)
     }
 
