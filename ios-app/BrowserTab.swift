@@ -251,7 +251,16 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable, WKNavigationDe
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        if challenge.protectionSpace.isProxy, let credential = ProxySettings.shared.credential {
+        // Split into locals rather than one compound "if a, let b = c { }"
+        // condition — the combined form was tripping up the compiler (a
+        // build log showed it trying to treat `isProxy` as an uncalled
+        // function, which only makes sense if something after it in the
+        // condition chain got misparsed as a trailing closure). Plain
+        // locals sidestep that entirely.
+        let isProxyChallenge: Bool = challenge.protectionSpace.isProxy
+        let storedCredential: URLCredential? = ProxySettings.shared.credential
+
+        if isProxyChallenge, let credential = storedCredential {
             completionHandler(.useCredential, credential)
             return
         }
