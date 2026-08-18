@@ -306,8 +306,23 @@
   // {kind, text} message to the native side on every status change; the
   // in-page badge below is kept ONLY as an opt-in debugging aid
   // (cfg.showStatusBadge), off by default.
+  //
+  // This script runs in EVERY frame of the page (main + any iframes —
+  // required so a site that runs its camera widget inside an iframe
+  // still gets the substituted camera there too, see BrowserTab.swift).
+  // But WKUserContentController message handlers are shared across all
+  // of a page's frames, so without this guard every frame's independent
+  // WebRTC connection would post its own status to the SAME native UI,
+  // and whichever frame happened to update last would win — flickering
+  // between "видео получено" and "соединение..." depending on which
+  // frame's signaling connection is doing better at that instant. Only
+  // the top-level frame is allowed to drive the native status indicator;
+  // every other (sub)frame still fully connects and substitutes its own
+  // camera, it just does so quietly.
+  const isTopFrame = (window === window.top);
   let badge = null;
   function postNativeStatus(kind, text) {
+    if (!isTopFrame) return;
     try {
       if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.camswapStatus) {
         window.webkit.messageHandlers.camswapStatus.postMessage({ kind: kind, text: text });
@@ -316,7 +331,7 @@
   }
   function setStatus(text, color, kind) {
     postNativeStatus(kind || 'idle', text);
-    if (!cfg.showStatusBadge) return;
+    if (!cfg.showStatusBadge || !isTopFrame) return;
     if (!badge) {
       badge = document.createElement('div');
       badge.style.cssText = 'position:fixed;bottom:8px;left:8px;z-index:2147483647;font:12px -apple-system,sans-serif;padding:4px 8px;border-radius:6px;background:rgba(0,0,0,0.6);color:#fff;pointer-events:none;';
@@ -336,7 +351,23 @@
     return [{ urls: 'stun:stun.l.google.com:19302' }];
   }
 
+  /// Closes whatever the current ws/pc are, if anything, before starting
+  /// a fresh connection attempt. Without this, every reconnect (page
+  /// reload, or a dropped connection retrying) left the PREVIOUS
+  /// RTCPeerConnection dangling instead of explicitly closed — its ICE
+  /// gathering had already opened real network sockets that don't
+  /// necessarily get released just because the JS variable holding it
+  /// got overwritten. A few of those piling up (e.g. three quick reloads
+  /// while testing) is a plausible way to exhaust locally available
+  /// sockets/ports and make the NEXT connection attempt simply hang on
+  /// "соединение...", which matches exactly what got reported.
+  function closeExistingConnection() {
+    if (pc) { try { pc.close(); } catch (e) {} pc = null; }
+    if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+  }
+
   function connectSignaling() {
+    closeExistingConnection();
     setStatus('соединение...', '#66aaff', 'connecting');
 
     try {
@@ -388,6 +419,10 @@
       }
 
       if (msg.type === 'offer') {
+        // Close any still-open previous connection before replacing it —
+        // a fresh 'offer' can arrive (e.g. the studio restarted) without
+        // a 'peer-left' ever having fired for the old one.
+        if (pc) { try { pc.close(); } catch (e) {} }
         pc = new RTCPeerConnection({ iceServers: iceServers() });
 
         pc.ontrack = (ev2) => {
@@ -524,6 +559,18 @@
       return nativePermissionsQuery(descriptor);
     }, 'query');
   }
+
+  // Explicitly tear down the socket/peer connection when this document is
+  // about to be replaced (reload, back/forward navigation, closing the
+  // tab) instead of just letting them get garbage-collected whenever —
+  // 'pagehide' fires reliably for all of those cases, including the
+  // WKWebView back-forward-cache path, and closing things here removes
+  // any doubt about how quickly the underlying network resources actually
+  // free up between one page load and the next.
+  window.addEventListener('pagehide', () => {
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    closeExistingConnection();
+  });
 
   console.info('[camswap] camera substitution active, room=' + cfg.room);
 

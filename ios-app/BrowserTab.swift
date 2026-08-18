@@ -147,25 +147,27 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable, WKNavigationDe
           showStatusBadge: \(showStatusBadge ? "true" : "false")
         };
         """
-        // forMainFrameOnly: true is deliberate — and the fix for a real bug
-        // found via a user report. With `false`, this script (and its
-        // whole WebRTC receiver) re-ran independently in EVERY frame on
-        // the page, including any iframe the site embeds. Each frame then
-        // opened its OWN separate signaling connection and joined the room
-        // as its own separate receiver (the multi-receiver signaling
-        // upgrade makes the server happily allow that) — so a page with
-        // e.g. a video-call iframe ended up with two independent,
-        // out-of-sync connections: one frame showing "видео получено"
-        // while another was stuck on "соединение...", and whichever frame
-        // the site actually reads getUserMedia's video from could easily
-        // be the one that never finished connecting. Restricting to the
-        // top-level frame gives exactly one connection per tab, which is
-        // what every other part of this app (the native status dot, the
-        // one-badge-per-tab bridge) already assumes.
+        // forMainFrameOnly is back to false (was briefly true) — a real
+        // user report showed WHY it has to be: some sites render their
+        // actual camera widget inside an iframe, and that iframe calls
+        // getUserMedia itself with its own separate JS context that our
+        // top-frame-only script could never reach — so that frame fell
+        // through to the REAL phone camera instead of the substituted
+        // one. Every frame needs its own override installed for the
+        // substitution to work no matter which frame the site's camera
+        // code actually lives in. The earlier problem this was trying to
+        // fix (multiple frames independently reporting conflicting status
+        // to the native UI) is now solved differently, inside camswap.js
+        // itself: only the TOP frame posts status back to the native app
+        // (see the `window === window.top` guard around
+        // postNativeStatus/setStatus there) — every frame still connects
+        // and substitutes its camera, but only one of them is allowed to
+        // drive the status dot, so the UI stays single-source-of-truth
+        // without silently breaking iframe-based camera widgets again.
         let configScript = WKUserScript(
             source: configJSON,
             injectionTime: .atDocumentStart,
-            forMainFrameOnly: true
+            forMainFrameOnly: false
         )
         controller.addUserScript(configScript)
 
@@ -176,7 +178,7 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable, WKNavigationDe
         let mainScript = WKUserScript(
             source: camswapSource,
             injectionTime: .atDocumentStart,
-            forMainFrameOnly: true
+            forMainFrameOnly: false
         )
         controller.addUserScript(mainScript)
 
