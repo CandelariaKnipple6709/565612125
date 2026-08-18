@@ -4,15 +4,33 @@
  * process (no separate `node server.js` step for the Windows app) while
  * staying testable on its own with plain Node.
  *
- * Pairs exactly two peers per room ("sender" = this app, "receiver" =
- * the iOS app) and relays SDP/ICE JSON between them. No media passes
- * through this server at all.
+ * Pairs ONE sender (this app) with ANY NUMBER of receivers (each open
+ * iOS tab is its own receiver connection) per room, and relays SDP/ICE
+ * JSON between the sender and whichever specific receiver a message is
+ * addressed to. No media passes through this server at all — only
+ * signaling messages.
+ *
+ * Each receiver gets a server-assigned clientId on join. WebRTC is
+ * inherently point-to-point, so supporting multiple simultaneous
+ * receivers means the sender keeps one separate RTCPeerConnection per
+ * receiver (see renderer.js) — this server's job is just to route each
+ * message to the right one of those, via targetId (sender -> receiver)
+ * and an auto-attached fromId (receiver -> sender, since there's only
+ * ever one sender to relay to, the receiver doesn't need to address it
+ * explicitly).
  */
 const http = require('http');
+const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
-function otherRole(role) {
-  return role === 'sender' ? 'receiver' : 'sender';
+function randomClientId() {
+  return crypto.randomBytes(6).toString('hex');
+}
+
+function safeSend(ws, obj) {
+  if (ws && ws.readyState === ws.OPEN) {
+    ws.send(JSON.stringify(obj));
+  }
 }
 
 /**
@@ -22,23 +40,38 @@ function otherRole(role) {
  * @returns {{ httpServer: http.Server, wss: WebSocketServer, close: () => void }}
  */
 function startSignalingServer({ port, log = () => {} }) {
-  const rooms = new Map(); // roomId -> { sender: ws|null, receiver: ws|null }
+  // roomId -> { sender: ws|null, receivers: Map<clientId, ws> }
+  const rooms = new Map();
 
   function getRoom(roomId) {
-    if (!rooms.has(roomId)) rooms.set(roomId, { sender: null, receiver: null });
+    if (!rooms.has(roomId)) rooms.set(roomId, { sender: null, receivers: new Map() });
     return rooms.get(roomId);
+  }
+
+  function deleteRoomIfEmpty(roomId) {
+    const room = rooms.get(roomId);
+    if (room && !room.sender && room.receivers.size === 0) rooms.delete(roomId);
   }
 
   function cleanupSocket(ws) {
     if (!ws.roomId || !ws.role) return;
     const room = rooms.get(ws.roomId);
     if (!room) return;
-    if (room[ws.role] === ws) room[ws.role] = null;
-    const peer = room[otherRole(ws.role)];
-    if (peer && peer.readyState === peer.OPEN) {
-      peer.send(JSON.stringify({ type: 'peer-left' }));
+
+    if (ws.role === 'sender') {
+      if (room.sender === ws) room.sender = null;
+      // Every receiver loses its one and only peer connection.
+      for (const rws of room.receivers.values()) {
+        safeSend(rws, { type: 'peer-left' });
+      }
+    } else {
+      if (room.receivers.get(ws.clientId) === ws) room.receivers.delete(ws.clientId);
+      // Sender only needs to tear down the ONE RTCPeerConnection that
+      // belonged to this specific receiver, not all of them.
+      safeSend(room.sender, { type: 'peer-left', peerId: ws.clientId });
     }
-    if (!room.sender && !room.receiver) rooms.delete(ws.roomId);
+
+    deleteRoomIfEmpty(ws.roomId);
   }
 
   const httpServer = http.createServer((req, res) => {
@@ -68,30 +101,60 @@ function startSignalingServer({ port, log = () => {} }) {
           return;
         }
         const room = getRoom(roomId);
-        if (room[role]) {
-          ws.send(JSON.stringify({ type: 'error', message: `a ${role} is already connected to room ${roomId}` }));
-          ws.close();
-          return;
-        }
-        room[role] = ws;
-        ws.roomId = roomId;
-        ws.role = role;
-        ws.send(JSON.stringify({ type: 'joined', room: roomId, role }));
 
-        const peer = room[otherRole(role)];
-        if (peer && peer.readyState === peer.OPEN) {
-          peer.send(JSON.stringify({ type: 'peer-joined' }));
-          ws.send(JSON.stringify({ type: 'peer-joined' }));
+        if (role === 'sender') {
+          if (room.sender) {
+            ws.send(JSON.stringify({ type: 'error', message: `a sender is already connected to room ${roomId}` }));
+            ws.close();
+            return;
+          }
+          room.sender = ws;
+          ws.roomId = roomId;
+          ws.role = 'sender';
+          ws.clientId = randomClientId();
+          ws.send(JSON.stringify({ type: 'joined', room: roomId, role, clientId: ws.clientId }));
+
+          // Edge case: receiver(s) already waiting in the room before the
+          // sender showed up — introduce them to each other now.
+          for (const [receiverId, rws] of room.receivers) {
+            safeSend(ws, { type: 'peer-joined', peerId: receiverId });
+            safeSend(rws, { type: 'peer-joined', peerId: ws.clientId });
+          }
+        } else {
+          const clientId = randomClientId();
+          room.receivers.set(clientId, ws);
+          ws.roomId = roomId;
+          ws.role = 'receiver';
+          ws.clientId = clientId;
+          ws.send(JSON.stringify({ type: 'joined', room: roomId, role, clientId }));
+
+          if (room.sender) {
+            safeSend(room.sender, { type: 'peer-joined', peerId: clientId });
+            safeSend(ws, { type: 'peer-joined', peerId: room.sender.clientId });
+          }
         }
         return;
       }
 
+      // Everything else (offer/answer/ice-candidate) is a routed relay
+      // message, valid only once joined.
       if (!ws.roomId || !ws.role) return;
       const room = rooms.get(ws.roomId);
       if (!room) return;
-      const peer = room[otherRole(ws.role)];
-      if (peer && peer.readyState === peer.OPEN) {
-        peer.send(JSON.stringify(msg));
+
+      if (ws.role === 'sender') {
+        // Sender addresses a specific receiver by targetId — there can
+        // be several, so this is required (unlike the receiver side).
+        const target = room.receivers.get(msg.targetId);
+        if (target) {
+          safeSend(target, Object.assign({}, msg, { fromId: ws.clientId }));
+        }
+      } else {
+        // Only one sender per room, so the server can address it on the
+        // receiver's behalf — no targetId needed from the receiver.
+        if (room.sender) {
+          safeSend(room.sender, Object.assign({}, msg, { fromId: ws.clientId }));
+        }
       }
     });
 
