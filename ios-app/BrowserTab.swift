@@ -251,13 +251,19 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable, WKNavigationDe
         didReceive challenge: URLAuthenticationChallenge,
         completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
     ) {
-        // Split into locals rather than one compound "if a, let b = c { }"
-        // condition — the combined form was tripping up the compiler (a
-        // build log showed it trying to treat `isProxy` as an uncalled
-        // function, which only makes sense if something after it in the
-        // condition chain got misparsed as a trailing closure). Plain
-        // locals sidestep that entirely.
-        let isProxyChallenge: Bool = challenge.protectionSpace.isProxy
+        // NOT using URLProtectionSpace.isProxy here on purpose: NSObject
+        // (which URLProtectionSpace inherits from) has its own unrelated
+        // `isProxy()` method (an old Objective-C runtime check for
+        // NSProxy instances, always false for a normal object). On this
+        // SDK that inherited method is what actually resolves when you
+        // write `.isProxy` — confirmed from a real build log, where it
+        // surfaced as "produces expected type 'Bool'; did you mean to
+        // call it with '()'?" pointing at this exact spot. Calling it
+        // would silently always return false and this proxy-auth
+        // handler would never fire. `proxyType` has no such collision:
+        // it's non-nil only for an actual proxy protection space, so
+        // it's both unambiguous and semantically what we want here.
+        let isProxyChallenge: Bool = challenge.protectionSpace.proxyType != nil
         let storedCredential: URLCredential? = ProxySettings.shared.credential
 
         if isProxyChallenge, let credential = storedCredential {
