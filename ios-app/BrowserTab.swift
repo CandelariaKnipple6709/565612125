@@ -147,10 +147,25 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable, WKNavigationDe
           showStatusBadge: \(showStatusBadge ? "true" : "false")
         };
         """
+        // forMainFrameOnly: true is deliberate — and the fix for a real bug
+        // found via a user report. With `false`, this script (and its
+        // whole WebRTC receiver) re-ran independently in EVERY frame on
+        // the page, including any iframe the site embeds. Each frame then
+        // opened its OWN separate signaling connection and joined the room
+        // as its own separate receiver (the multi-receiver signaling
+        // upgrade makes the server happily allow that) — so a page with
+        // e.g. a video-call iframe ended up with two independent,
+        // out-of-sync connections: one frame showing "видео получено"
+        // while another was stuck on "соединение...", and whichever frame
+        // the site actually reads getUserMedia's video from could easily
+        // be the one that never finished connecting. Restricting to the
+        // top-level frame gives exactly one connection per tab, which is
+        // what every other part of this app (the native status dot, the
+        // one-badge-per-tab bridge) already assumes.
         let configScript = WKUserScript(
             source: configJSON,
             injectionTime: .atDocumentStart,
-            forMainFrameOnly: false
+            forMainFrameOnly: true
         )
         controller.addUserScript(configScript)
 
@@ -161,7 +176,7 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable, WKNavigationDe
         let mainScript = WKUserScript(
             source: camswapSource,
             injectionTime: .atDocumentStart,
-            forMainFrameOnly: false
+            forMainFrameOnly: true
         )
         controller.addUserScript(mainScript)
 

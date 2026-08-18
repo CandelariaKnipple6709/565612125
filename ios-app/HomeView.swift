@@ -14,10 +14,11 @@ struct HomeView: View {
     var body: some View {
         ScrollView {
             VStack(spacing: 18) {
-                Image(systemName: "video.fill")
-                    .font(.system(size: 40))
-                    .foregroundStyle(Color.accentColor)
-                    .padding(.top, 28)
+                HomeIcon.image
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 72, height: 72)
+                    .padding(.top, 24)
 
                 Text("CamSwap")
                     .font(.title2.weight(.semibold))

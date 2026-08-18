@@ -254,6 +254,24 @@
     return canvasStream;
   }
 
+  // Resolves the first time a REAL incoming video frame gets drawn onto
+  // the canvas (not the black placeholder fill from startup) — used by
+  // getUserMedia below so a site that asks for the camera doesn't get
+  // handed a stream that's still showing a black frame at that exact
+  // moment. Resolves once and stays resolved for the rest of the page's
+  // life (a real camera doesn't go black again just because a second
+  // getUserMedia call happens later).
+  let firstFrameReceived = false;
+  let resolveFirstFrame;
+  const firstFramePromise = new Promise((resolve) => { resolveFirstFrame = resolve; });
+  function waitForFirstFrame(timeoutMs) {
+    if (firstFrameReceived) return Promise.resolve();
+    return Promise.race([
+      firstFramePromise,
+      new Promise((resolve) => setTimeout(resolve, timeoutMs))
+    ]);
+  }
+
   let drawing = false;
   function startDrawLoop() {
     if (drawing) return;
@@ -268,6 +286,10 @@
         const dw = vw * scale, dh = vh * scale;
         const dx = (WIDTH - dw) / 2, dy = (HEIGHT - dh) / 2;
         ctx.drawImage(hiddenVideo, dx, dy, dw, dh);
+        if (!firstFrameReceived) {
+          firstFrameReceived = true;
+          resolveFirstFrame();
+        }
       }
       requestAnimationFrame(draw);
     };
@@ -435,6 +457,15 @@
       if (!nativeGetUserMedia) throw new DOMException('getUserMedia unavailable', 'NotSupportedError');
       return nativeGetUserMedia(constraints);
     }
+
+    // Wait (briefly) for the first real WebRTC frame before handing the
+    // stream back, so the exact moment the site gets camera access is
+    // also the moment it starts seeing real video — not a black
+    // placeholder frame that only turns into real video a second or two
+    // later. Capped at 4s so a site still gets SOMETHING promptly even
+    // if the desktop studio app isn't running/connected yet (falls back
+    // to the old black-frame-then-catches-up behavior in that case).
+    await waitForFirstFrame(4000);
 
     const tracks = [getCanvasStream().getVideoTracks()[0]];
 
