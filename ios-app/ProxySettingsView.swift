@@ -3,6 +3,12 @@ import SwiftUI
 /// Dedicated proxy screen: entirely optional, off by default. Only
 /// touches networking once "Использовать прокси" is on AND a host is
 /// filled in (see ProxySettings.isConfigured).
+///
+/// Deliberately built with plain HStack rows instead of LabeledContent —
+/// a build tried that first and the compiler choked on the two-trailing-
+/// closure `LabeledContent { ... } label: { ... }` form (reported as
+/// generic-inference errors on the enclosing Section). HStack + Text +
+/// TextField is less elegant but has none of that ambiguity.
 struct ProxySettingsView: View {
     let onChanged: () -> Void
 
@@ -20,39 +26,33 @@ struct ProxySettingsView: View {
 
             if proxy.enabled {
                 Section("Сервер") {
-                    LabeledContent {
+                    fieldRow(label: "Хост / IP") {
                         TextField("например 203.0.113.10", text: $proxy.host)
                             .keyboardType(.URL)
                             .autocapitalization(.none)
                             .disableAutocorrection(true)
                             .multilineTextAlignment(.trailing)
-                    } label: {
-                        Text("Хост / IP")
                     }
-                    LabeledContent {
+                    fieldRow(label: "Порт") {
                         TextField("8080", text: $proxy.port)
                             .keyboardType(.numberPad)
                             .multilineTextAlignment(.trailing)
-                    } label: {
-                        Text("Порт")
                     }
                 }
 
-                Section("Авторизация (необязательно)") {
-                    LabeledContent {
+                Section {
+                    fieldRow(label: "Логин") {
                         TextField("логин", text: $proxy.username)
                             .autocapitalization(.none)
                             .disableAutocorrection(true)
                             .multilineTextAlignment(.trailing)
-                    } label: {
-                        Text("Логин")
                     }
-                    LabeledContent {
+                    fieldRow(label: "Пароль") {
                         SecureField("пароль", text: $proxy.password)
                             .multilineTextAlignment(.trailing)
-                    } label: {
-                        Text("Пароль")
                     }
+                } header: {
+                    Text("Авторизация (необязательно)")
                 } footer: {
                     Text("Пароль хранится в Keychain на этом устройстве, а не в обычных настройках приложения.")
                 }
@@ -76,5 +76,15 @@ struct ProxySettingsView: View {
         .onChange(of: proxy.port) { _ in onChanged() }
         .onChange(of: proxy.username) { _ in onChanged() }
         .onChange(of: proxy.password) { _ in onChanged() }
+    }
+
+    @ViewBuilder
+    private func fieldRow<Field: View>(label: String, @ViewBuilder field: () -> Field) -> some View {
+        HStack {
+            Text(label)
+                .foregroundStyle(.secondary)
+            Spacer(minLength: 12)
+            field()
+        }
     }
 }
