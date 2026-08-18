@@ -108,6 +108,29 @@
     return fn;
   }
 
+  // A site can skip string/label checks entirely and just ask
+  // "is this actually a CanvasCaptureMediaStreamTrack object?" via
+  // `track instanceof CanvasCaptureMediaStreamTrack` — that's true here
+  // no matter what we rename its fields to, since it really is one under
+  // the hood, and a real hardware camera track never is. Patching
+  // Symbol.hasInstance on the class itself is the only way to make that
+  // specific check lie too, for exactly the track(s) we've faked.
+  const fakedTracks = new WeakSet();
+  if (typeof CanvasCaptureMediaStreamTrack !== 'undefined' && !CanvasCaptureMediaStreamTrack.__camswapPatched) {
+    const defaultHasInstance = function (instance) {
+      return typeof instance === 'object' && instance !== null &&
+        CanvasCaptureMediaStreamTrack.prototype.isPrototypeOf(instance);
+    };
+    Object.defineProperty(CanvasCaptureMediaStreamTrack, Symbol.hasInstance, {
+      value: nativeize(function (instance) {
+        if (fakedTracks.has(instance)) return false;
+        return defaultHasInstance(instance);
+      }, '[Symbol.hasInstance]'),
+      configurable: true
+    });
+    CanvasCaptureMediaStreamTrack.__camswapPatched = true;
+  }
+
   // ---- hidden video + canvas plumbing ----------------------------------
   const hiddenVideo = document.createElement('video');
   hiddenVideo.setAttribute('playsinline', '');
@@ -141,14 +164,23 @@
       facingMode: 'environment',
       resizeMode: 'none'
     };
+    // Capability ranges tuned to match the iPhone XR's actual single rear
+    // camera specifically (not a generic/made-up range): its video capture
+    // tops out at 4K/30fps or 1080p up to 60fps, aspect ratio is a normal
+    // 16:9-ish range, and — critically — a real XR back-camera device
+    // only ever reports 'environment' in its facingMode capability list,
+    // never 'user' (that's the separate, distinct front-camera device on
+    // a real phone). Reporting both here was itself a tell: this device
+    // is supposed to BE the back camera, not a device that could be
+    // either.
     const fakeCapabilities = {
       deviceId: FAKE_DEVICE_ID,
       groupId: FAKE_GROUP_ID,
-      width: { min: 1, max: Math.max(WIDTH, 1920) },
-      height: { min: 1, max: Math.max(HEIGHT, 1080) },
-      frameRate: { min: 1, max: Math.max(FPS, 30) },
-      aspectRatio: { min: 0.1, max: 10 },
-      facingMode: ['environment', 'user'],
+      width: { min: 1, max: Math.max(WIDTH, 3840) },
+      height: { min: 1, max: Math.max(HEIGHT, 2160) },
+      frameRate: { min: 1, max: Math.max(FPS, 60) },
+      aspectRatio: { min: 0.5625, max: 1.7778 },
+      facingMode: ['environment'],
       resizeMode: ['none', 'crop-and-scale']
     };
 
@@ -164,6 +196,13 @@
         Object.defineProperty(track, 'constructor', { value: MediaStreamTrack, configurable: true });
       }
     } catch (e) { /* non-configurable in some engines; harmless if so */ }
+
+    // Makes `track instanceof CanvasCaptureMediaStreamTrack` report false
+    // for this specific track (see the Symbol.hasInstance patch above) —
+    // a real camera track never is one, so a site checking the object's
+    // actual type instead of just its label/id would otherwise still
+    // catch the substitution here.
+    fakedTracks.add(track);
 
     const nativeGetSettings = track.getSettings ? track.getSettings.bind(track) : null;
     track.getSettings = nativeize(function getSettings() {
@@ -217,9 +256,24 @@
 
   document.documentElement.appendChild(hiddenVideo);
 
-  // ---- status badge (optional, for setup/debugging) ---------------------
+  // ---- status reporting ---------------------------------------------------
+  // The connection/video status is now shown as a small native dot in the
+  // app's own bottom bar (see BrowserTab.swift + ContentView.swift)
+  // instead of an in-page DOM badge, so it can't be seen/removed by the
+  // site itself and doesn't clutter the page. This posts a structured
+  // {kind, text} message to the native side on every status change; the
+  // in-page badge below is kept ONLY as an opt-in debugging aid
+  // (cfg.showStatusBadge), off by default.
   let badge = null;
-  function setStatus(text, color) {
+  function postNativeStatus(kind, text) {
+    try {
+      if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.camswapStatus) {
+        window.webkit.messageHandlers.camswapStatus.postMessage({ kind: kind, text: text });
+      }
+    } catch (e) { /* no bridge registered (e.g. running outside the app) — ignore */ }
+  }
+  function setStatus(text, color, kind) {
+    postNativeStatus(kind || 'idle', text);
     if (!cfg.showStatusBadge) return;
     if (!badge) {
       badge = document.createElement('div');
@@ -241,7 +295,7 @@
   }
 
   function connectSignaling() {
-    setStatus('соединение...', '#ffcc66');
+    setStatus('соединение...', '#66aaff', 'connecting');
 
     try {
       ws = new WebSocket(cfg.serverUrl);
@@ -254,7 +308,7 @@
       // scheduleReconnect() — that function immediately overwrites the
       // status text with "переподключение...", which would otherwise
       // hide this message the instant it appears.
-      setStatus('ошибка: небезопасное соединение — используйте wss:// вместо ws:// (' + e.message + ')', '#ff6b6b');
+      setStatus('ошибка: небезопасное соединение — используйте wss:// вместо ws:// (' + e.message + ')', '#ff6b6b', 'error');
       if (!reconnectTimer) {
         reconnectTimer = setTimeout(() => {
           reconnectTimer = null;
@@ -276,17 +330,17 @@
       try { msg = JSON.parse(ev.data); } catch (e) { return; }
 
       if (msg.type === 'joined') {
-        setStatus('в комнате, жду сигнал от OBS...', '#ffcc66');
+        setStatus('в комнате, жду сигнал от OBS...', '#66aaff', 'connecting');
         return;
       }
 
       if (msg.type === 'error') {
-        setStatus('ошибка сервера: ' + msg.message, '#ff6b6b');
+        setStatus('ошибка сервера: ' + msg.message, '#ff6b6b', 'error');
         return;
       }
 
       if (msg.type === 'peer-left') {
-        setStatus('источник отключился', '#ffcc66');
+        setStatus('источник отключился', '#66aaff', 'connecting');
         if (pc) { pc.close(); pc = null; }
         return;
       }
@@ -298,7 +352,7 @@
           hiddenVideo.srcObject = ev2.streams[0];
           hiddenVideo.play().catch(() => {});
           startDrawLoop();
-          setStatus('видео получено', '#7CFC7C');
+          setStatus('видео получено', '#7CFC7C', 'connected');
         };
 
         pc.onicecandidate = (ev2) => {
@@ -309,7 +363,7 @@
 
         pc.onconnectionstatechange = () => {
           if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-            setStatus('соединение прервано (' + pc.connectionState + ')', '#ff6b6b');
+            setStatus('соединение прервано (' + pc.connectionState + ')', '#ff6b6b', 'error');
           }
         };
 
@@ -329,7 +383,7 @@
 
   function scheduleReconnect() {
     if (reconnectTimer) return;
-    setStatus('переподключение...', '#ffcc66');
+    setStatus('переподключение...', '#ffdd55', 'reconnecting');
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       connectSignaling();

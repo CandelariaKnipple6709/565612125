@@ -112,7 +112,10 @@ final class TabManager: ObservableObject {
         tab.applyCamswapConfig(
             serverUrl: UserDefaults.standard.string(forKey: "camswap.serverUrl") ?? "",
             room: UserDefaults.standard.string(forKey: "camswap.room") ?? "",
-            showStatusBadge: UserDefaults.standard.object(forKey: "camswap.showBadge") as? Bool ?? true
+            // Defaults to off now that connection status has its own
+            // native indicator (the colored dot in the bottom bar) —
+            // this in-page badge is just an opt-in debugging aid now.
+            showStatusBadge: UserDefaults.standard.object(forKey: "camswap.showBadge") as? Bool ?? false
         )
     }
 

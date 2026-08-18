@@ -17,6 +17,9 @@ struct ContentView: View {
     @State private var showBookmarksHistory = false
     @State private var showClearConfirm = false
     @State private var justCleared = false
+    @State private var trashBounce = false
+    @State private var trashShowCheckmark = false
+    @State private var statusDotShowCheckmark = false
 
     @State private var addressBarText: String = ""
     @FocusState private var addressBarFocused: Bool
@@ -27,8 +30,8 @@ struct ContentView: View {
         VStack(spacing: 0) {
             topBar
                 .padding(.horizontal, 12)
-                .padding(.top, 6)
-                .padding(.bottom, 8)
+                .padding(.top, 5)
+                .padding(.bottom, 6)
                 .background(.bar)
 
             Divider()
@@ -78,6 +81,17 @@ struct ContentView: View {
         }
         .onChange(of: tabManager.activeTabID) { _ in
             addressBarText = activeTab?.currentURLString ?? ""
+        }
+        .onChange(of: tabManager.activeTab?.camswapState) { newValue in
+            guard newValue == .connected else { return }
+            withAnimation(.spring(response: 0.35, dampingFraction: 0.6)) {
+                statusDotShowCheckmark = true
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.3) {
+                withAnimation(.easeInOut(duration: 0.3)) {
+                    statusDotShowCheckmark = false
+                }
+            }
         }
         .sheet(isPresented: $showSettings) {
             SettingsView(
@@ -133,10 +147,22 @@ struct ContentView: View {
         .alert("Очистить куки, кэш и историю?", isPresented: $showClearConfirm) {
             Button("Отмена", role: .cancel) {}
             Button("Очистить всё", role: .destructive) {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.5)) {
+                    trashBounce = true
+                }
                 tabManager.clearAllBrowsingData {
                     justCleared = true
                     addressBarText = ""
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { justCleared = false }
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
+                        trashShowCheckmark = true
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                        withAnimation(.easeOut(duration: 0.2)) { trashBounce = false }
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+                        justCleared = false
+                        withAnimation(.easeInOut(duration: 0.25)) { trashShowCheckmark = false }
+                    }
                 }
             }
         } message: {
@@ -244,7 +270,8 @@ struct ContentView: View {
             }
         }
         .padding(.horizontal, 10)
-        .padding(.vertical, 8)
+        .padding(.vertical, 6)
+        .frame(minHeight: 44)
         .background(Color(.secondarySystemBackground), in: Capsule())
     }
 
@@ -262,19 +289,27 @@ struct ContentView: View {
             .frame(maxWidth: .infinity)
 
             Button {
-                showBookmarksHistory = true
+                activeTab?.webView.goForward()
             } label: {
-                Image(systemName: "book")
+                Image(systemName: "chevron.right")
                     .font(.title3)
             }
+            .disabled(!(activeTab?.webView.canGoForward ?? false))
             .frame(maxWidth: .infinity)
 
-            Button {
-                showClearConfirm = true
-            } label: {
-                Image(systemName: "trash.circle.fill")
-                    .font(.system(size: 34))
-                    .foregroundStyle(.red)
+            ZStack(alignment: .topTrailing) {
+                Button {
+                    showClearConfirm = true
+                } label: {
+                    Image(systemName: trashShowCheckmark ? "checkmark.circle.fill" : "trash.circle.fill")
+                        .font(.system(size: 34))
+                        .foregroundStyle(trashShowCheckmark ? .green : .red)
+                        .scaleEffect(trashBounce ? 1.18 : 1.0)
+                        .symbolEffect(.bounce, value: trashShowCheckmark)
+                }
+
+                statusDot
+                    .offset(x: 6, y: -2)
             }
             .frame(maxWidth: .infinity)
 
@@ -287,14 +322,45 @@ struct ContentView: View {
             .frame(maxWidth: .infinity)
 
             Button {
-                activeTab?.webView.goForward()
+                showBookmarksHistory = true
             } label: {
-                Image(systemName: "chevron.right")
+                Image(systemName: "book")
                     .font(.title3)
             }
-            .disabled(!(activeTab?.webView.canGoForward ?? false))
             .frame(maxWidth: .infinity)
         }
+    }
+
+    /// Small native connection-status indicator, replacing the old
+    /// in-page camswap.js badge. Bound to the ACTIVE tab's camswapState
+    /// so it always reflects whichever tab is currently on screen.
+    private var statusDot: some View {
+        let state = tabManager.activeTab?.camswapState ?? .idle
+        let color: Color = {
+            switch state {
+            case .connected: return .green
+            case .connecting: return .blue
+            case .reconnecting: return .yellow
+            case .error: return .red
+            case .idle: return .gray
+            }
+        }()
+
+        return ZStack {
+            if statusDotShowCheckmark {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.green)
+                    .transition(.scale.combined(with: .opacity))
+            } else {
+                Circle()
+                    .fill(color)
+                    .opacity(state == .idle ? 0.3 : 1.0)
+                    .frame(width: 9, height: 9)
+                    .transition(.scale.combined(with: .opacity))
+            }
+        }
+        .animation(.easeInOut(duration: 0.25), value: statusDotShowCheckmark)
     }
 
     private func threatOverlay(host: String, tab: BrowserTab) -> some View {

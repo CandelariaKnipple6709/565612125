@@ -36,6 +36,7 @@ targets:
       - path: ProxySettings.swift
       - path: KeychainHelper.swift
       - path: HomeView.swift
+      - path: AddSiteSheet.swift
       - path: TabSwitcherView.swift
       - path: BookmarksHistoryView.swift
       - path: SettingsView.swift

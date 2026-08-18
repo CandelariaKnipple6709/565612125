@@ -3,13 +3,56 @@ import WebKit
 import Combine
 import UIKit
 
+/// The camswap connection/video state, mirrored from the injected JS
+/// (camswap.js posts {kind, text} to the native "camswapStatus" message
+/// handler on every status change — see BrowserTab.userContentController
+/// below). Drives the small colored status dot in the bottom bar
+/// (ContentView) instead of the old in-page debug badge.
+enum CamswapConnectionState: Equatable {
+    /// Nothing configured yet, or the tab hasn't loaded a page that runs
+    /// the script (e.g. the home screen).
+    case idle
+    /// Signaling WebSocket connecting, or connected and waiting in the
+    /// room for the studio to start publishing.
+    case connecting
+    /// The signaling connection dropped and is retrying.
+    case reconnecting
+    /// WebRTC video is actually flowing — the substituted camera is live.
+    case connected
+    case error
+
+    init(jsKind: String) {
+        switch jsKind {
+        case "connecting": self = .connecting
+        case "reconnecting": self = .reconnecting
+        case "connected": self = .connected
+        case "error": self = .error
+        default: self = .idle
+        }
+    }
+}
+
+/// WKUserContentController retains its message handlers strongly. Adding
+/// `self` (a BrowserTab) directly as a handler would create a
+/// BrowserTab -> webView -> configuration -> userContentController ->
+/// BrowserTab retain cycle, the same leak WKWebView is notorious for.
+/// This weak proxy is the standard fix: the controller retains the
+/// proxy instead, and the proxy only holds a weak reference back.
+private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
+    weak var target: WKScriptMessageHandler?
+    init(target: WKScriptMessageHandler) { self.target = target }
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        target?.userContentController(userContentController, didReceive: message)
+    }
+}
+
 /// One browser tab: owns its own WKWebView, tracks loading/URL/title
 /// state for the UI, and knows how to (re)inject the camswap
 /// camera-substitution script plus the active privacy protections into
 /// itself. Every tab shares the same WKWebsiteDataStore (via
 /// TabManager.sharedWebsiteDataStore) so cookies/proxy/login state are
 /// consistent across tabs, like a normal browser.
-final class BrowserTab: NSObject, ObservableObject, Identifiable, WKNavigationDelegate {
+final class BrowserTab: NSObject, ObservableObject, Identifiable, WKNavigationDelegate, WKScriptMessageHandler {
     let id = UUID()
 
     @Published var isLoading: Bool = false
@@ -19,6 +62,7 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable, WKNavigationDe
     @Published var isHome: Bool = true
     @Published var snapshot: UIImage?
     @Published var blockedThreat: String?
+    @Published var camswapState: CamswapConnectionState = .idle
 
     let webView: WKWebView
 
@@ -30,7 +74,7 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable, WKNavigationDe
     private var lastVideoWidth: Int = 1280
     private var lastVideoHeight: Int = 720
     private var lastFPS: Int = 30
-    private var lastShowStatusBadge: Bool = true
+    private var lastShowStatusBadge: Bool = false
 
     /// Real Safari's user agent on iOS includes a "Version/X.Y.Z Safari/604.1"
     /// token that WKWebView does NOT add by default — without it, some sites
@@ -48,6 +92,26 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable, WKNavigationDe
         webView.customUserAgent = BrowserTab.safariUserAgent
         super.init()
         webView.navigationDelegate = self
+        // Registered once here (not in applyCamswapConfig, which gets
+        // called repeatedly) since WKUserContentController.add(_:name:)
+        // throws/asserts if the same handler name is added twice without
+        // an intervening remove.
+        webView.configuration.userContentController.add(
+            WeakScriptMessageHandler(target: self),
+            name: "camswapStatus"
+        )
+    }
+
+    // MARK: - WKScriptMessageHandler
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.name == "camswapStatus",
+              let body = message.body as? [String: Any],
+              let kindRaw = body["kind"] as? String else { return }
+        camswapState = CamswapConnectionState(jsKind: kindRaw)
+        if let text = body["text"] as? String, !text.isEmpty {
+            statusText = text
+        }
     }
 
     // MARK: - camswap camera substitution
@@ -61,7 +125,7 @@ final class BrowserTab: NSObject, ObservableObject, Identifiable, WKNavigationDe
         videoWidth: Int = 1280,
         videoHeight: Int = 720,
         fps: Int = 30,
-        showStatusBadge: Bool = true
+        showStatusBadge: Bool = false
     ) {
         lastServerUrl = serverUrl
         lastRoom = room
