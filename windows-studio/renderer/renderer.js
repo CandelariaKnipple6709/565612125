@@ -277,14 +277,31 @@ stageWrap.addEventListener('wheel', (e) => {
   syncToolbarFromSelected();
 }, { passive: false });
 
-// ---- WebRTC sender --------------------------------------------------------
+// ---- WebRTC sender ---------------------------------------------------
+// One studio can now feed MULTIPLE simultaneously-open browser tabs on
+// the phone at once (each tab is its own independent "receiver" over
+// the signaling connection) — WebRTC itself is point-to-point, so that
+// means one separate RTCPeerConnection per connected tab, all fed from
+// the same canvas output stream. `peers` maps the server-assigned
+// peerId of each receiver to its own RTCPeerConnection.
 let ws = null;
-let pc = null;
+let peers = new Map(); // peerId -> RTCPeerConnection
 let outputStream = null;
 
 function setStatus(text, kind) {
   statusEl.textContent = text;
   statusEl.className = kind || '';
+}
+
+function updateConnectedStatus() {
+  const n = peers.size;
+  if (n === 0) {
+    setStatus('в комнате «' + pairing.room + '». Ждём телефон...', 'warn');
+  } else if (n === 1) {
+    setStatus('трансляция активна (1 вкладка на телефоне)', 'ok');
+  } else {
+    setStatus('трансляция активна (' + n + ' вкладки/вкладок на телефоне)', 'ok');
+  }
 }
 
 function iceServers() {
@@ -316,56 +333,72 @@ function connect() {
     if (msg.type === 'error') { setStatus('сервер: ' + msg.message, 'err'); return; }
 
     if (msg.type === 'joined') {
-      setStatus('в комнате «' + room + '». Ждём телефон...', 'warn');
+      updateConnectedStatus();
       return;
     }
 
     if (msg.type === 'peer-joined') {
-      setStatus('телефон подключился, устанавливаю канал...', 'warn');
-      await startPeerConnection();
+      await startPeerConnection(msg.peerId);
       return;
     }
 
     if (msg.type === 'peer-left') {
-      setStatus('телефон отключился. Ждём переподключения...', 'warn');
-      if (pc) { pc.close(); pc = null; }
+      // peerId always present here for a sender (see signaling.js) —
+      // only that one tab's connection goes away, everyone else's stays
+      // untouched.
+      const existing = peers.get(msg.peerId);
+      if (existing) { existing.close(); peers.delete(msg.peerId); }
+      updateConnectedStatus();
       return;
     }
 
-    if (msg.type === 'answer' && pc) {
-      await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
-      setStatus('трансляция активна', 'ok');
+    if (msg.type === 'answer' && msg.fromId) {
+      const pc = peers.get(msg.fromId);
+      if (pc) await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
       return;
     }
 
-    if (msg.type === 'ice-candidate' && pc && msg.candidate) {
-      try { await pc.addIceCandidate(msg.candidate); } catch (e) {}
+    if (msg.type === 'ice-candidate' && msg.fromId && msg.candidate) {
+      const pc = peers.get(msg.fromId);
+      if (pc) { try { await pc.addIceCandidate(msg.candidate); } catch (e) {} }
       return;
     }
   };
 }
 
-async function startPeerConnection() {
-  pc = new RTCPeerConnection({ iceServers: iceServers() });
+async function startPeerConnection(peerId) {
+  // A tab reconnecting (e.g. after a page reload) sends a fresh
+  // peer-joined with the same peerId's predecessor already cleaned up
+  // server-side, but guard anyway in case of a stray duplicate.
+  const stale = peers.get(peerId);
+  if (stale) { stale.close(); peers.delete(peerId); }
+
+  const pc = new RTCPeerConnection({ iceServers: iceServers() });
+  peers.set(peerId, pc);
   getOutputStream().getTracks().forEach(track => pc.addTrack(track, outputStream));
 
   pc.onicecandidate = (ev) => {
-    if (ev.candidate) ws.send(JSON.stringify({ type: 'ice-candidate', candidate: ev.candidate }));
+    if (ev.candidate) {
+      ws.send(JSON.stringify({ type: 'ice-candidate', candidate: ev.candidate, targetId: peerId }));
+    }
   };
   pc.onconnectionstatechange = () => {
-    if (pc.connectionState === 'connected') setStatus('трансляция активна', 'ok');
     if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-      setStatus('соединение потеряно (' + pc.connectionState + ')', 'err');
+      peers.delete(peerId);
+      updateConnectedStatus();
+    } else if (pc.connectionState === 'connected') {
+      updateConnectedStatus();
     }
   };
 
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-  ws.send(JSON.stringify({ type: 'offer', sdp: offer }));
+  ws.send(JSON.stringify({ type: 'offer', sdp: offer, targetId: peerId }));
 }
 
 function disconnect() {
-  if (pc) { pc.close(); pc = null; }
+  peers.forEach(pc => pc.close());
+  peers.clear();
   if (ws) { ws.close(); ws = null; }
 }
 
