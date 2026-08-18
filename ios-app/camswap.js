@@ -48,6 +48,66 @@
     ? navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices)
     : null;
 
+  // ---- anti-fingerprint helpers ------------------------------------------
+  // Some platforms don't just call getUserMedia and accept whatever comes
+  // back — they actively try to detect a "virtual camera" / spoofing tool
+  // first, and quietly refuse if they find one (this is almost certainly
+  // what "видит камеру, но специально не хочет её использовать" is). The
+  // two most common checks:
+  //   1. Function.prototype.toString() on navigator.mediaDevices.*: a real
+  //      native browser method always stringifies to
+  //      "function x() { [native code] }" — a plain JS override exposes
+  //      its actual source instead, an instant tell.
+  //   2. The reported device's deviceId/groupId/label: real iOS camera
+  //      devices use long opaque hash-like ids and a real Apple label
+  //      ("Back Camera"/"Front Camera"), not an obviously synthetic
+  //      string like "camswap-virtual-camera".
+  // Both are patched below so the substituted camera reads exactly like a
+  // real one at the JS-introspection level, not just at the "did
+  // getUserMedia resolve" level.
+
+  function randomHex(len) {
+    const bytes = new Uint8Array(Math.ceil(len / 2));
+    if (window.crypto && window.crypto.getRandomValues) {
+      window.crypto.getRandomValues(bytes);
+    } else {
+      for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+    }
+    return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('').slice(0, len);
+  }
+
+  // Generated once per page load so every code path (getUserMedia's
+  // track.getSettings(), enumerateDevices(), track.getCapabilities())
+  // reports the exact same consistent "device" — real cameras don't
+  // change identity between calls either.
+  const FAKE_DEVICE_ID = randomHex(64);
+  const FAKE_GROUP_ID = randomHex(64);
+  // facingMode is 'environment' (rear lens) below, since this app is
+  // about showing physical spaces — label it the way iOS itself labels
+  // the rear camera rather than a generic/synthetic name.
+  const FAKE_LABEL = 'Back Camera';
+
+  // Patches Function.prototype.toString itself (once, globally) so any
+  // function registered via nativeize() below reports a native-looking
+  // string no matter how a page calls it (fn.toString(), String(fn),
+  // Function.prototype.toString.call(fn), etc.), while every other
+  // function on the page keeps stringifying normally.
+  const nativeToStringMap = new WeakMap();
+  const realFunctionToString = Function.prototype.toString;
+  Function.prototype.toString = function () {
+    if (nativeToStringMap.has(this)) return nativeToStringMap.get(this);
+    return realFunctionToString.call(this);
+  };
+  // This patch is itself an overridden function and would unmask itself
+  // the moment a page inspects Function.prototype.toString directly —
+  // give it an entry in its own map too.
+  nativeToStringMap.set(Function.prototype.toString, realFunctionToString.call(realFunctionToString));
+
+  function nativeize(fn, name) {
+    nativeToStringMap.set(fn, 'function ' + name + '() { [native code] }');
+    return fn;
+  }
+
   // ---- hidden video + canvas plumbing ----------------------------------
   const hiddenVideo = document.createElement('video');
   hiddenVideo.setAttribute('playsinline', '');
@@ -72,8 +132,8 @@
   // to report camera-like values so those checks pass too.
   function patchFakeVideoTrack(track) {
     const fakeSettings = {
-      deviceId: 'camswap-virtual-camera',
-      groupId: 'camswap-virtual-camera-group',
+      deviceId: FAKE_DEVICE_ID,
+      groupId: FAKE_GROUP_ID,
       width: WIDTH,
       height: HEIGHT,
       frameRate: FPS,
@@ -82,8 +142,8 @@
       resizeMode: 'none'
     };
     const fakeCapabilities = {
-      deviceId: 'camswap-virtual-camera',
-      groupId: 'camswap-virtual-camera-group',
+      deviceId: FAKE_DEVICE_ID,
+      groupId: FAKE_GROUP_ID,
       width: { min: 1, max: Math.max(WIDTH, 1920) },
       height: { min: 1, max: Math.max(HEIGHT, 1080) },
       frameRate: { min: 1, max: Math.max(FPS, 30) },
@@ -93,26 +153,35 @@
     };
 
     try {
-      Object.defineProperty(track, 'label', { value: 'Camera', configurable: true });
+      Object.defineProperty(track, 'label', { value: FAKE_LABEL, configurable: true });
     } catch (e) { /* some engines make label non-configurable; harmless if so */ }
 
+    // Also mask the object's own class identity: a page that does
+    // track.constructor.name would otherwise see
+    // "CanvasCaptureMediaStreamTrack" instead of "MediaStreamTrack".
+    try {
+      if (typeof MediaStreamTrack !== 'undefined') {
+        Object.defineProperty(track, 'constructor', { value: MediaStreamTrack, configurable: true });
+      }
+    } catch (e) { /* non-configurable in some engines; harmless if so */ }
+
     const nativeGetSettings = track.getSettings ? track.getSettings.bind(track) : null;
-    track.getSettings = function () {
+    track.getSettings = nativeize(function getSettings() {
       const base = nativeGetSettings ? (nativeGetSettings() || {}) : {};
       return Object.assign({}, base, fakeSettings);
-    };
+    }, 'getSettings');
 
-    track.getCapabilities = function () {
+    track.getCapabilities = nativeize(function getCapabilities() {
       return fakeCapabilities;
-    };
+    }, 'getCapabilities');
 
     // Real getUserMedia callers sometimes call applyConstraints() after
     // the fact (e.g. to switch resolution/facingMode) — a canvas track
     // can't actually honor that, but resolving instead of throwing keeps
     // sites that don't check the result from treating it as fatal.
-    track.applyConstraints = function () {
+    track.applyConstraints = nativeize(function applyConstraints() {
       return Promise.resolve();
-    };
+    }, 'applyConstraints');
 
     return track;
   }
@@ -275,14 +344,14 @@
   // frame until a stream arrives) instead of silently falling back to the
   // phone's real camera because an unrelated error aborted the script.
   const fakeVideoDevice = {
-    deviceId: 'camswap-virtual-camera',
-    groupId: 'camswap-virtual-camera-group',
+    deviceId: FAKE_DEVICE_ID,
+    groupId: FAKE_GROUP_ID,
     kind: 'videoinput',
-    label: 'Camera',
+    label: FAKE_LABEL,
     toJSON() { return this; }
   };
 
-  navigator.mediaDevices.getUserMedia = async function (constraints) {
+  navigator.mediaDevices.getUserMedia = nativeize(async function getUserMedia(constraints) {
     const wantsVideo = !!(constraints && constraints.video);
     const wantsAudio = !!(constraints && constraints.audio);
 
@@ -307,17 +376,17 @@
     }
 
     return new MediaStream(tracks);
-  };
+  }, 'getUserMedia');
 
   if (nativeEnumerateDevices) {
-    navigator.mediaDevices.enumerateDevices = async function () {
+    navigator.mediaDevices.enumerateDevices = nativeize(async function enumerateDevices() {
       const real = await nativeEnumerateDevices();
       // Keep real audio inputs (so mic selection still works), but
-      // replace video inputs with the single fake "Camera" entry so
+      // replace video inputs with the single fake camera entry so
       // device pickers on the site don't expose/select the real lens.
       const audioOnly = real.filter(d => d.kind !== 'videoinput');
       return [fakeVideoDevice, ...audioOnly];
-    };
+    }, 'enumerateDevices');
   }
 
   // ---- navigator.permissions.query override -----------------------------
@@ -342,13 +411,13 @@
       return target;
     }
 
-    navigator.permissions.query = function (descriptor) {
+    navigator.permissions.query = nativeize(function query(descriptor) {
       const name = descriptor && descriptor.name;
       if (name === 'camera' || name === 'microphone') {
         return Promise.resolve(fakePermissionStatus(name));
       }
       return nativePermissionsQuery(descriptor);
-    };
+    }, 'query');
   }
 
   console.info('[camswap] camera substitution active, room=' + cfg.room);
