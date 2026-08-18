@@ -64,10 +64,64 @@
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, WIDTH, HEIGHT);
 
+  // A canvas-captured track (CanvasCaptureMediaStreamTrack) reports empty/
+  // missing getSettings()/getCapabilities() by default, unlike a real
+  // camera track. Some sites validate the track this way (not just via
+  // getUserMedia succeeding) before deciding a "real" camera is present,
+  // and reject an empty-capabilities track. Patch the track's own methods
+  // to report camera-like values so those checks pass too.
+  function patchFakeVideoTrack(track) {
+    const fakeSettings = {
+      deviceId: 'camswap-virtual-camera',
+      groupId: 'camswap-virtual-camera-group',
+      width: WIDTH,
+      height: HEIGHT,
+      frameRate: FPS,
+      aspectRatio: WIDTH / HEIGHT,
+      facingMode: 'environment',
+      resizeMode: 'none'
+    };
+    const fakeCapabilities = {
+      deviceId: 'camswap-virtual-camera',
+      groupId: 'camswap-virtual-camera-group',
+      width: { min: 1, max: Math.max(WIDTH, 1920) },
+      height: { min: 1, max: Math.max(HEIGHT, 1080) },
+      frameRate: { min: 1, max: Math.max(FPS, 30) },
+      aspectRatio: { min: 0.1, max: 10 },
+      facingMode: ['environment', 'user'],
+      resizeMode: ['none', 'crop-and-scale']
+    };
+
+    try {
+      Object.defineProperty(track, 'label', { value: 'Camera', configurable: true });
+    } catch (e) { /* some engines make label non-configurable; harmless if so */ }
+
+    const nativeGetSettings = track.getSettings ? track.getSettings.bind(track) : null;
+    track.getSettings = function () {
+      const base = nativeGetSettings ? (nativeGetSettings() || {}) : {};
+      return Object.assign({}, base, fakeSettings);
+    };
+
+    track.getCapabilities = function () {
+      return fakeCapabilities;
+    };
+
+    // Real getUserMedia callers sometimes call applyConstraints() after
+    // the fact (e.g. to switch resolution/facingMode) — a canvas track
+    // can't actually honor that, but resolving instead of throwing keeps
+    // sites that don't check the result from treating it as fatal.
+    track.applyConstraints = function () {
+      return Promise.resolve();
+    };
+
+    return track;
+  }
+
   let canvasStream = null;
   function getCanvasStream() {
     if (!canvasStream) {
       canvasStream = canvas.captureStream(FPS);
+      canvasStream.getVideoTracks().forEach(patchFakeVideoTrack);
     }
     return canvasStream;
   }
