@@ -76,12 +76,32 @@
     return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('').slice(0, len);
   }
 
-  // Generated once per page load so every code path (getUserMedia's
-  // track.getSettings(), enumerateDevices(), track.getCapabilities())
-  // reports the exact same consistent "device" — real cameras don't
-  // change identity between calls either.
-  const FAKE_DEVICE_ID = randomHex(64);
-  const FAKE_GROUP_ID = randomHex(64);
+  // CRITICAL: a real camera's deviceId/groupId is STABLE for a given site
+  // across visits (Safari derives it from a per-origin salt and keeps
+  // reusing it) — it never changes on its own between page loads. Picking
+  // a brand new random id on every single reload/re-visit, as this used
+  // to do, is one of the most standard fingerprint-consistency checks an
+  // anti-fraud system can run: "this device's identity changed between
+  // sessions" is a huge red flag, and it lines up exactly with the
+  // reported symptom (works, then gets flagged specifically after
+  // re-entering the same page). Persisting the id in localStorage (keyed
+  // per-origin automatically, same as the real browser behavior it's
+  // mimicking) fixes that: generated once, then reused on every later
+  // visit to this same site for as long as the site's local data isn't
+  // wiped (matching how a real device id would only change if the user
+  // cleared site data too).
+  function persistentFakeId(key, len) {
+    try {
+      const existing = window.localStorage.getItem(key);
+      if (existing && existing.length === len) return existing;
+    } catch (e) { /* localStorage unavailable in this context — fall through */ }
+    const fresh = randomHex(len);
+    try { window.localStorage.setItem(key, fresh); } catch (e) { /* ignore, not fatal */ }
+    return fresh;
+  }
+
+  const FAKE_DEVICE_ID = persistentFakeId('__camswap_device_id', 64);
+  const FAKE_GROUP_ID = persistentFakeId('__camswap_group_id', 64);
   // facingMode is 'environment' (rear lens) below, since this app is
   // about showing physical spaces — label it the way iOS itself labels
   // the rear camera rather than a generic/synthetic name.
