@@ -242,17 +242,6 @@
       return Promise.resolve();
     }, 'applyConstraints');
 
-    // getConstraints() is the third member of the same trio sites check
-    // alongside getSettings()/getCapabilities() — a real track echoes
-    // back whatever constraints it was opened with (or {} if opened with
-    // a bare `true`). Wasn't overridden before, which is an easy
-    // cross-check inconsistency (getSettings claiming a real device while
-    // getConstraints stays empty/native-default for a track that's
-    // supposedly the same one).
-    track.getConstraints = nativeize(function getConstraints() {
-      return {};
-    }, 'getConstraints');
-
     return track;
   }
 
@@ -317,23 +306,8 @@
   // {kind, text} message to the native side on every status change; the
   // in-page badge below is kept ONLY as an opt-in debugging aid
   // (cfg.showStatusBadge), off by default.
-  //
-  // This script runs in EVERY frame of the page (main + any iframes —
-  // required so a site that runs its camera widget inside an iframe
-  // still gets the substituted camera there too, see BrowserTab.swift).
-  // But WKUserContentController message handlers are shared across all
-  // of a page's frames, so without this guard every frame's independent
-  // WebRTC connection would post its own status to the SAME native UI,
-  // and whichever frame happened to update last would win — flickering
-  // between "видео получено" and "соединение..." depending on which
-  // frame's signaling connection is doing better at that instant. Only
-  // the top-level frame is allowed to drive the native status indicator;
-  // every other (sub)frame still fully connects and substitutes its own
-  // camera, it just does so quietly.
-  const isTopFrame = (window === window.top);
   let badge = null;
   function postNativeStatus(kind, text) {
-    if (!isTopFrame) return;
     try {
       if (window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.camswapStatus) {
         window.webkit.messageHandlers.camswapStatus.postMessage({ kind: kind, text: text });
@@ -342,7 +316,7 @@
   }
   function setStatus(text, color, kind) {
     postNativeStatus(kind || 'idle', text);
-    if (!cfg.showStatusBadge || !isTopFrame) return;
+    if (!cfg.showStatusBadge) return;
     if (!badge) {
       badge = document.createElement('div');
       badge.style.cssText = 'position:fixed;bottom:8px;left:8px;z-index:2147483647;font:12px -apple-system,sans-serif;padding:4px 8px;border-radius:6px;background:rgba(0,0,0,0.6);color:#fff;pointer-events:none;';
@@ -362,23 +336,7 @@
     return [{ urls: 'stun:stun.l.google.com:19302' }];
   }
 
-  /// Closes whatever the current ws/pc are, if anything, before starting
-  /// a fresh connection attempt. Without this, every reconnect (page
-  /// reload, or a dropped connection retrying) left the PREVIOUS
-  /// RTCPeerConnection dangling instead of explicitly closed — its ICE
-  /// gathering had already opened real network sockets that don't
-  /// necessarily get released just because the JS variable holding it
-  /// got overwritten. A few of those piling up (e.g. three quick reloads
-  /// while testing) is a plausible way to exhaust locally available
-  /// sockets/ports and make the NEXT connection attempt simply hang on
-  /// "соединение...", which matches exactly what got reported.
-  function closeExistingConnection() {
-    if (pc) { try { pc.close(); } catch (e) {} pc = null; }
-    if (ws) { try { ws.close(); } catch (e) {} ws = null; }
-  }
-
   function connectSignaling() {
-    closeExistingConnection();
     setStatus('соединение...', '#66aaff', 'connecting');
 
     try {
@@ -430,10 +388,6 @@
       }
 
       if (msg.type === 'offer') {
-        // Close any still-open previous connection before replacing it —
-        // a fresh 'offer' can arrive (e.g. the studio restarted) without
-        // a 'peer-left' ever having fired for the old one.
-        if (pc) { try { pc.close(); } catch (e) {} }
         pc = new RTCPeerConnection({ iceServers: iceServers() });
 
         pc.ontrack = (ev2) => {
@@ -493,62 +447,6 @@
     toJSON() { return this; }
   };
 
-  // A real iPhone XR reports TWO video input devices — front AND back —
-  // not just one. Only ever exposing one (the substituted back camera)
-  // was itself an inconsistency: a site whose flow offers a "flip
-  // camera" button, or that explicitly asks for the front camera for a
-  // face/liveness step (very plausible for a security/verification
-  // platform), would see something a real iPhone never shows. This fake
-  // front-camera entry exists purely so enumerateDevices() looks
-  // complete — selecting it (or any facingMode:'user' request) below
-  // routes to the REAL native front camera, untouched, not a second
-  // substituted stream. Only the back/"Apple logo side" camera was ever
-  // meant to be faked.
-  const FAKE_FRONT_DEVICE_ID = persistentFakeId('__camswap_front_device_id', 64);
-  const FAKE_FRONT_GROUP_ID = persistentFakeId('__camswap_front_group_id', 64);
-  const fakeFrontVideoDevice = {
-    deviceId: FAKE_FRONT_DEVICE_ID,
-    groupId: FAKE_FRONT_GROUP_ID,
-    kind: 'videoinput',
-    label: 'Front Camera',
-    toJSON() { return this; }
-  };
-
-  // True if a getUserMedia video constraint is explicitly asking for the
-  // front/selfie camera — either by facingMode:'user' or by directly
-  // selecting our fake front-camera deviceId.
-  function wantsFrontCamera(videoConstraint) {
-    if (!videoConstraint || typeof videoConstraint !== 'object') return false;
-    const fm = videoConstraint.facingMode;
-    if (fm) {
-      if (typeof fm === 'string' && fm === 'user') return true;
-      if (typeof fm === 'object' && fm !== null) {
-        if (fm.exact === 'user' || fm.ideal === 'user') return true;
-        if (Array.isArray(fm) && fm.includes('user')) return true;
-      }
-    }
-    const did = videoConstraint.deviceId;
-    if (did === FAKE_FRONT_DEVICE_ID) return true;
-    if (did && typeof did === 'object') {
-      if (did.exact === FAKE_FRONT_DEVICE_ID || did.ideal === FAKE_FRONT_DEVICE_ID) return true;
-      if (Array.isArray(did) && did.includes(FAKE_FRONT_DEVICE_ID)) return true;
-    }
-    return false;
-  }
-
-  // Strips OUR synthetic front-camera deviceId out of a constraint object
-  // before forwarding it to the real native getUserMedia — the native
-  // implementation has never heard of that id and would throw
-  // OverconstrainedError if asked for it verbatim. facingMode:'user'
-  // alone is enough to get the real front camera.
-  function sanitizeForNativeFrontCamera(videoConstraint) {
-    if (videoConstraint === true || !videoConstraint) return { facingMode: 'user' };
-    const clone = Object.assign({}, videoConstraint);
-    delete clone.deviceId;
-    if (!clone.facingMode) clone.facingMode = 'user';
-    return clone;
-  }
-
   navigator.mediaDevices.getUserMedia = nativeize(async function getUserMedia(constraints) {
     const wantsVideo = !!(constraints && constraints.video);
     const wantsAudio = !!(constraints && constraints.audio);
@@ -560,41 +458,14 @@
       return nativeGetUserMedia(constraints);
     }
 
-    if (wantsFrontCamera(constraints.video) && nativeGetUserMedia) {
-      // Explicit front/selfie camera request: this app only ever needed
-      // to disguise the REAR camera, so hand back the real, completely
-      // untouched front camera here. That's also strictly safer than
-      // faking it: zero fingerprint surface because nothing about it is
-      // modified at all.
-      try {
-        const realStream = await nativeGetUserMedia({
-          video: sanitizeForNativeFrontCamera(constraints.video),
-          audio: constraints.audio
-        });
-        // A real native getUserMedia call only succeeds if the OS-level
-        // camera permission is truly granted — reflect that in our fake
-        // permission state too, so a later permissions.query('camera')
-        // call (which doesn't distinguish front/back, there's only one
-        // camera permission on iOS) correctly reports 'granted'.
-        markCameraPermissionGranted();
-        return realStream;
-      } catch (e) {
-        console.warn('[camswap] real front camera request failed, falling back to substituted camera:', e);
-        // fall through to the substituted stream below rather than fail outright
-      }
-    }
-
     // Wait (briefly) for the first real WebRTC frame before handing the
     // stream back, so the exact moment the site gets camera access is
     // also the moment it starts seeing real video — not a black
     // placeholder frame that only turns into real video a second or two
-    // later. Capped well under a second and a half so a site's own
-    // internal timeout on getUserMedia (real cameras usually resolve in
-    // well under 500ms) doesn't fire first and make it give up before
-    // this ever resolves — worse than a brief black frame. Falls back to
-    // the old black-frame-then-catches-up behavior if the desktop studio
-    // app isn't running/connected yet.
-    await waitForFirstFrame(1500);
+    // later. Capped at 4s so a site still gets SOMETHING promptly even
+    // if the desktop studio app isn't running/connected yet (falls back
+    // to the old black-frame-then-catches-up behavior in that case).
+    await waitForFirstFrame(4000);
 
     const tracks = [getCanvasStream().getVideoTracks()[0]];
 
@@ -609,10 +480,6 @@
       }
     }
 
-    // A real camera permission, once granted, stays granted — see the
-    // permissions.query override below, which reads this same flag.
-    markCameraPermissionGranted();
-
     return new MediaStream(tracks);
   }, 'getUserMedia');
 
@@ -620,53 +487,30 @@
     navigator.mediaDevices.enumerateDevices = nativeize(async function enumerateDevices() {
       const real = await nativeEnumerateDevices();
       // Keep real audio inputs (so mic selection still works), but
-      // replace video inputs with our fake back+front camera pair so
-      // device pickers on the site don't expose/select the real rear
-      // lens (the front one routes to the real hardware anyway, see
-      // wantsFrontCamera() above).
+      // replace video inputs with the single fake camera entry so
+      // device pickers on the site don't expose/select the real lens.
       const audioOnly = real.filter(d => d.kind !== 'videoinput');
-      return [fakeVideoDevice, fakeFrontVideoDevice, ...audioOnly];
+      return [fakeVideoDevice, ...audioOnly];
     }, 'enumerateDevices');
   }
 
   // ---- navigator.permissions.query override -----------------------------
-  // This used to hardcode 'camera' as permanently "granted" from the very
-  // first page load — which is actually LESS realistic than doing
-  // nothing, not more. A real camera permission starts at 'prompt' and
-  // only flips to 'granted' the moment the user actually allows it via
-  // getUserMedia; a site that checks permissions.query FIRST and only
-  // shows its "allow camera access" UI (the thing that actually calls
-  // getUserMedia) when the state ISN'T already 'granted' would, with the
-  // old hardcoded version, conclude access was already sorted out and
-  // skip that UI/call entirely — meaning getUserMedia for video might
-  // never even get invoked. That lines up exactly with "перестало
-  // запрашивать камеру". Track the real state instead: 'prompt' until
-  // this script's getUserMedia override has actually served a
-  // substituted video stream at least once, THEN 'granted' — same shape
-  // as a real permission, and persisted via localStorage so it stays
-  // 'granted' on later visits too, just like a real one would.
-  //
-  // Microphone is NOT faked here — audio always goes through the real
-  // native getUserMedia untouched (see above), so its real permission
-  // state is already 100% accurate without any help; overriding it would
-  // only add a way to be wrong.
-  const GRANTED_KEY = '__camswap_camera_permission_granted';
-  let cameraPermissionGranted = false;
-  try { cameraPermissionGranted = window.localStorage.getItem(GRANTED_KEY) === '1'; } catch (e) { /* ignore */ }
-  function markCameraPermissionGranted() {
-    if (cameraPermissionGranted) return;
-    cameraPermissionGranted = true;
-    try { window.localStorage.setItem(GRANTED_KEY, '1'); } catch (e) { /* ignore */ }
-  }
-
+  // Some sites check camera/mic permission status via the Permissions API
+  // BEFORE ever calling getUserMedia — if that reports anything other than
+  // "granted" (WKWebView's support for the 'camera'/'microphone' query
+  // names is unreliable), the site can bail out early with a "no camera"
+  // message without ever reaching our getUserMedia override above. This
+  // makes those two names always resolve as already-granted; everything
+  // else (e.g. 'geolocation', 'notifications') still goes through the
+  // native implementation untouched.
   if (navigator.permissions && navigator.permissions.query) {
     const nativePermissionsQuery = navigator.permissions.query.bind(navigator.permissions);
 
-    function fakeCameraPermissionStatus() {
+    function fakePermissionStatus(name) {
       const target = new EventTarget();
       Object.defineProperties(target, {
-        state: { get: () => (cameraPermissionGranted ? 'granted' : 'prompt'), enumerable: true },
-        name: { value: 'camera', writable: false, enumerable: true },
+        state: { value: 'granted', writable: false, enumerable: true },
+        name: { value: name, writable: false, enumerable: true },
         onchange: { value: null, writable: true, enumerable: true }
       });
       return target;
@@ -674,24 +518,12 @@
 
     navigator.permissions.query = nativeize(function query(descriptor) {
       const name = descriptor && descriptor.name;
-      if (name === 'camera') {
-        return Promise.resolve(fakeCameraPermissionStatus());
+      if (name === 'camera' || name === 'microphone') {
+        return Promise.resolve(fakePermissionStatus(name));
       }
       return nativePermissionsQuery(descriptor);
     }, 'query');
   }
-
-  // Explicitly tear down the socket/peer connection when this document is
-  // about to be replaced (reload, back/forward navigation, closing the
-  // tab) instead of just letting them get garbage-collected whenever —
-  // 'pagehide' fires reliably for all of those cases, including the
-  // WKWebView back-forward-cache path, and closing things here removes
-  // any doubt about how quickly the underlying network resources actually
-  // free up between one page load and the next.
-  window.addEventListener('pagehide', () => {
-    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
-    closeExistingConnection();
-  });
 
   console.info('[camswap] camera substitution active, room=' + cfg.room);
 
